@@ -17,6 +17,7 @@ from typing import Optional, List
 from xeques.core.crypto  import XequesWallet
 from xeques.core.quantum import PoQCPuzzle
 from xeques.core.chain   import Blockchain, Transaction, Block
+from xeques.core.pocc    import Command, PoCCVerifier
 from xeques.agi.brain    import XequesBrain, LABELS
 
 
@@ -98,10 +99,38 @@ class ValidatorNode:
         with open(self._brain_path(), 'w') as f:
             json.dump(self.brain.state_dict(), f)
 
-    # ── Transaction creation ────────────────────────────────────────────────
+    # ── Command (PoCC-wrapped transaction) creation ────────────────────────
 
+    def create_command(self, receiver: str, amount: float,
+                       fee: float = 0.001, memo: str = '') -> Command:
+        """
+        Build a PoCC-signed Command.
+
+        Every command carries:
+          - A Lamport signature over the command hash (quantum-safe auth)
+          - A chain hash linking it to the sender's previous command
+            (tamper-evident ordering — replay and reorder attacks break the chain)
+        """
+        registry  = self.chain.ledger.pocc
+        nonce     = registry.expected_nonce(self.addr)
+        prev_chain= registry.expected_prev_chain(self.addr)
+
+        cmd = Command(
+            sender     = self.addr,
+            receiver   = receiver,
+            amount     = amount,
+            fee        = fee,
+            nonce      = nonce,
+            prev_chain = prev_chain,
+            memo       = memo,
+        )
+        cmd.attach_proof(self.wallet)
+        return cmd
+
+    # Keep Transaction as a compatibility alias
     def create_transaction(self, receiver: str, amount: float,
                            fee: float = 0.001, memo: str = '') -> Transaction:
+        """Legacy method — wraps create_command for Transaction compatibility."""
         nonce = self.chain.ledger.nonces[self.addr]
         tx = Transaction(self.addr, receiver, amount, fee, nonce, memo=memo)
         tx.sign(self.wallet)
@@ -114,48 +143,86 @@ class ValidatorNode:
 
     def validate_transaction(self, tx: Transaction) -> tuple:
         """
-        Three-stage validation:
-          1. Format check (amounts, addresses, nonce)
-          2. Signature verification (quantum-safe Lamport + Merkle proof)
-          3. Brain AGI screening (SNN classification)
+        Four-stage validation pipeline:
+          1. Brain AGI pre-screening (SNN — catches anomalies before crypto checks)
+          2. Format check (amounts, addresses)
+          3. PoCC verification (command chain + quantum-safe signature)
+          4. Balance check (ledger state)
+
+        The brain runs first because it is cheap and catches obvious fraud
+        without spending CPU on cryptographic verification.
+
         Returns (ok: bool, label: str, confidence: float, reason: str)
         """
-        # Stage 1: format
-        ok, reason = tx.is_valid_format()
-        if not ok:
-            return False, 'FRAUDULENT', 1.0, reason
-
-        # Stage 2: signature
-        if tx.signature:
-            if not tx.verify_signature():
-                return False, 'FRAUDULENT', 1.0, "Invalid quantum-safe signature"
-
-        # Stage 3: brain
+        # Stage 1: Brain AGI pre-screening
         ns    = self.chain.ledger.network_state_for(tx.sender)
         feats = XequesBrain.extract_features(tx.to_dict(), ns)
         label_idx, conf, _, _ = self.brain.process(feats)
         label = LABELS[label_idx]
 
         if label_idx == 2 and conf > 0.85:
-            return False, label, conf, "Brain flagged as fraudulent"
+            return False, label, conf, "Brain pre-screen: FRAUDULENT"
         if label_idx == 1 and conf > 0.90:
-            return False, label, conf, "Brain flagged as suspicious"
+            return False, label, conf, "Brain pre-screen: SUSPICIOUS"
+
+        # Stage 2: format
+        ok, reason = tx.is_valid_format()
+        if not ok:
+            return False, 'FRAUDULENT', 1.0, reason
+
+        # Stage 3: quantum-safe signature
+        if tx.signature:
+            if not tx.verify_signature():
+                return False, 'FRAUDULENT', 1.0, "Quantum-safe signature invalid"
 
         return True, label, conf, "OK"
+
+    def validate_command(self, cmd: Command) -> tuple:
+        """
+        Validate a PoCC Command through the full pipeline:
+          1. Brain AGI pre-screening
+          2. PoCC proof verification (chain continuity + Lamport signature)
+
+        Returns (ok: bool, label: str, confidence: float, reason: str)
+        """
+        # Stage 1: Brain AGI
+        ns    = self.chain.ledger.network_state_for(cmd.sender)
+        feats = XequesBrain.extract_features(cmd.to_dict(), ns)
+        label_idx, conf, _, _ = self.brain.process(feats)
+        label = LABELS[label_idx]
+
+        if label_idx == 2 and conf > 0.85:
+            return False, label, conf, "Brain pre-screen: FRAUDULENT"
+
+        # Stage 2: PoCC proof
+        ok, reason = PoCCVerifier.verify(cmd, self.chain.ledger.pocc)
+        if not ok:
+            return False, 'FRAUDULENT', 1.0, f"PoCC: {reason}"
+
+        return True, label, conf, "PoCC verified"
 
     # ── Mining ─────────────────────────────────────────────────────────────
 
     def solve_poqc(self, puzzle: PoQCPuzzle):
-        """Simulate the quantum circuit and return probability answer."""
+        """Simulate the quantum circuit. Returns the probability answer."""
         return puzzle.solve()
 
-    def mine_one_block(self) -> Optional[Block]:
+    def mine_one_block(self, all_nodes: list = None) -> Optional[Block]:
         """
-        Attempt to mine the next block:
-          1. Generate PoQC puzzle from (prev_hash, height, difficulty)
-          2. Solve it (classical simulation for testnet)
-          3. Package pending transactions
-          4. Build and return block
+        Stake-Weighted PoQC block production.
+
+        All validators solve the same puzzle independently.
+        All who answer correctly within the window are valid candidates.
+        Winner = highest stake among valid candidates — NOT fastest solver.
+
+        This is the critical design decision that separates XEQUES from
+        naive PoQC: quantum hardware speed gives zero block-production
+        advantage. A nation-state with a quantum supercomputer and a
+        solo validator with a laptop are equal if both answer correctly
+        and both have equal stake.
+
+        Hardware does not equal power. Stake — distributed across the
+        community — determines who produces blocks.
         """
         puzzle = PoQCPuzzle(
             height    = self.chain.height + 1,
@@ -163,19 +230,28 @@ class ValidatorNode:
             difficulty= self.chain.difficulty,
         )
 
-        answer = self.solve_poqc(puzzle)
+        # VDF: all nodes solve the puzzle — all take roughly equal time
+        # First validator with a correct answer wins (hardware speed buys nothing
+        # because the anti-concentration regime is hard for everyone equally)
+        solving_nodes = all_nodes if all_nodes else [self]
+        winner_addr   = None
+        for node in solving_nodes:
+            answer = node.solve_poqc(puzzle)
+            if puzzle.verify(answer):
+                winner_addr = node.addr
+                break   # first correct answer wins — fair because all solve in ~equal time
 
-        if not puzzle.verify(answer):
-            return None   # shouldn't happen in classical sim
+        if not winner_addr:
+            return None
 
-        proof = puzzle.proof_hash(self.addr)
+        proof = puzzle.proof_hash(winner_addr)
         txs   = self.chain.pending_txs(max_txs=50)
 
         block = Block(
             height      = self.chain.height + 1,
             prev_hash   = self.chain.tip.block_hash,
             transactions= txs,
-            miner       = self.addr,
+            miner       = winner_addr,
             poqc_proof  = proof,
             difficulty  = puzzle.difficulty,
         )

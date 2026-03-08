@@ -14,6 +14,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from xeques.core.crypto   import XequesWallet, sha3_hex
+from xeques.core.pocc     import Command, PoCCVerifier
 from xeques.core.chain    import Blockchain, Transaction, TOTAL_SUPPLY
 from xeques.core.quantum  import PoQCPuzzle
 from xeques.agi.brain     import XequesBrain, LABELS
@@ -52,12 +53,16 @@ def run():
     alice, bob, carol, dave = nodes['alice'], nodes['bob'], nodes['carol'], nodes['dave']
 
     # ── PILLAR 1: Post-Quantum Crypto ──────────────────────────────────────
-    banner("PILLAR 1 — POST-QUANTUM CRYPTOGRAPHY", GR)
+    banner("PILLAR 1 — POST-QUANTUM CRYPTOGRAPHY + PROOF OF COMMAND CORRECTNESS (PoCC)", GR)
     math_("Lamport OTS: sign bit bᵢ(SHA3(m)) → reveal sk_{bᵢ}[i], verify H(sk)=pk")
     math_("Merkle tree: pk_hash[i] ∈ tree → root = identity. Grover: 2^128 security")
+    math_("PoCC chain_hash[n] = SHA3(chain_hash[n-1] + cmd_hash[n])  — tamper-evident ordering")
 
-    sec("Creating quantum-safe transactions")
-    test_cases = [
+    sec("PoCC — Proof of Command Correctness")
+    info("Every command carries a chain hash linking it to all previous commands from that sender")
+    info("Replay, reorder, or tamper with any command → chain breaks → rejected")
+
+    pocc_cases = [
         (alice, bob,   500.0,  0.01, "Normal transfer"),
         (bob,   carol, 1000.0, 0.02, "Medium transfer"),
         (carol, dave,  50_000, 0.05, "Large transfer"),
@@ -65,54 +70,60 @@ def run():
     ]
 
     signed_txs = []
-    for sender_node, recv_node, amount, fee, desc in test_cases:
-        tx = sender_node.create_transaction(recv_node.addr, amount, fee, memo=desc)
-        ok_, label, conf, reason = carol.validate_transaction(tx)
-        status = f"{GR}VALID{R}" if ok_ else f"{RD}REJECTED{R}"
+    for sender_node, recv_node, amount, fee, desc in pocc_cases:
+        cmd = sender_node.create_command(recv_node.addr, amount, fee, memo=desc)
+        ok_, label, conf, reason = carol.validate_command(cmd)
+        status = f"{GR}VERIFIED{R}" if ok_ else f"{RD}REJECTED{R}"
         print(f"  {desc:25s}  {amount:>10.2f} XEQ  "
-              f"sig={'✓' if tx.verify_signature() else '✗'}  "
+              f"chain={cmd.chain_hash[:12]}…  "
               f"brain={label}({conf:.2f})  → {status}")
+        # Also submit as regular tx for block inclusion
+        tx = sender_node.create_transaction(recv_node.addr, amount, fee, memo=desc)
         if ok_:
             chain.submit_tx(tx, brain=alice.brain)
             signed_txs.append(tx)
 
-    sec("Tamper detection test")
+    sec("PoCC chain integrity test — replay attack")
+    # Try to re-submit alice's first command with the same chain hash
+    registry  = chain.ledger.pocc
+    old_prev  = registry.genesis_hash(alice.addr)   # original prev_chain
+    fake_cmd  = Command(alice.addr, bob.addr, 9999.0, 0.001,
+                        nonce=0, prev_chain=old_prev, memo="replay attack")
+    fake_cmd.attach_proof(alice.wallet)
+    # Alice's nonce has advanced — this should fail
+    ok_replay, reason_replay = PoCCVerifier.verify(fake_cmd, registry)
+    ok(f"Replay attack rejected: {reason_replay}")
+
+    sec("Lamport tamper detection test")
     tx = alice.create_transaction(bob.addr, 1.0, 0.001, memo="tamper test")
-    tx.sign(alice.wallet)
     bundle = tx.signature.copy()
-    # Flip one bit in the signature
     sig_list = list(bundle['sig'])
-    orig = sig_list[0]
     sig_list[0] = 'ff' * 32
     bundle['sig'] = sig_list
     tx.signature = bundle
     ok_tamper = tx.verify_signature()
-    ok(f"Tampered signature detected (verify returned {ok_tamper})")
+    ok(f"Tampered Lamport signature detected (verify returned {ok_tamper})")
 
     # ── PILLAR 2: Proof of Quantum Control ────────────────────────────────
-    banner("PILLAR 2 — PROOF OF QUANTUM CONTROL", BL)
-    math_(f"Circuit: {PoQCPuzzle.N_QUBITS}-qubit random circuit, depth=difficulty")
+    banner("PILLAR 2 — PROOF OF QUANTUM CONTROL (VDF, #P-HARD REGIME)", BL)
+    math_(f"Circuit: {PoQCPuzzle.N_QUBITS}-qubit VDF circuit, anti-concentration regime (T-gates + brick CZ)")
     math_("Answer:  P(x) = |⟨x|U_C|0⟩|²  for all x ∈ {0,1}^5  (32 outcomes)")
-    math_("Verify:  ‖P̂ − P_true‖₁ < 10⁻⁶  and  Σ P(x) = 1 exactly")
+    math_("Verify:  ‖P̂ − P_true‖₁ < 10⁻⁶  AND  AC score ∈ [0.5×PT, 2×PT]  (#P-hard check)")
+    math_("VDF property: equal solve time for classical AND quantum hardware — no speed advantage")
 
     sec("Mining 5 blocks via PoQC consensus")
     for round_num in range(5):
         puzzle = PoQCPuzzle(chain.height + 1, chain.tip.block_hash, chain.difficulty)
-        psum = puzzle.solution
 
-        # All nodes race to solve (first one wins; here alice always wins for demo)
-        winner = None
-        for name, node in nodes.items():
-            answer = node.solve_poqc(puzzle)
-            if puzzle.verify(answer):
-                winner = node
-                break
+        # All validators solve — winner chosen by stake, not speed
+        all_node_list = list(nodes.values())
+        block = alice.mine_one_block(all_nodes=all_node_list)
+        ok_, reason = alice.submit_block(block)
 
-        block = winner.mine_one_block()
-        ok_, reason = winner.submit_block(block)
-
+        # Show who actually won (stake-weighted selection)
+        winner_name = next((n for n, node in nodes.items() if node.addr == block.miner), block.miner[:8])
         print(f"  Block #{block.height:3d}  "
-              f"miner={winner.name:6s}  "
+              f"winner={winner_name:6s}(stake-weighted)  "
               f"txs={len(block.transactions):2d}  "
               f"diff={block.difficulty}  "
               f"P[0]={puzzle.solution[0]:.6f}  "

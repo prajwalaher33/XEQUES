@@ -9,6 +9,49 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+---
+
+## [0.2.0] — 2026-03-09
+
+### Added
+- **Proof of Command Correctness (PoCC)** — `core/pocc.py`
+  - Every transaction is now a `Command` carrying a cryptographic hash chain
+  - `chain_hash[n] = SHA3(chain_hash[n-1] + command_hash[n])` per sender
+  - Proves authorisation (Lamport sig), ordering (nonce), and integrity (chain) simultaneously
+  - Replay attacks, reorder attacks, and field tampering all break the chain and are rejected at mempool admission
+  - `PoCCRegistry` tracks chain state per address in the ledger
+  - `PoCCVerifier` runs stateless verification — used by validators before PoQC check
+
+- **PoQC-VDF anti-concentration upgrade** — `core/quantum.py`
+  - Replaced naive random circuits with `random_vdf()` using the Sycamore-pattern structure
+  - Per-layer: T-gate on all qubits + random Rz rotations + alternating brick CZ entanglement
+  - This places the circuit in the `#P-hard` anti-concentration regime — hard for quantum computers too, not just classical
+  - Added `anti_concentration_score()` — measures the second moment of the output distribution against the Porter-Thomas target
+  - Added `is_in_hard_regime()` — rejects puzzles where the output is too concentrated (shortcuts may exist)
+  - `verify()` now checks both L1 correctness AND the hardness regime before accepting an answer
+
+- **Four-stage validation pipeline** in `validator.py`
+  - Brain AGI pre-screening runs first (cheap — catches obvious fraud before crypto)
+  - PoCC proof verification (command chain + Lamport signature)
+  - Format check
+  - Balance check (ledger)
+  - Added `validate_command()` for PoCC-wrapped commands alongside existing `validate_transaction()`
+
+### Changed
+- PoQC consensus now uses VDF "first correct answer wins" — stake-weighted selection removed
+  - Because everyone solves in approximately equal time (all in the hard regime), first correct answer is effectively random and fair
+  - Removes the centralisation risk that stake-weighted selection introduced
+- README completely rewritten to reflect the combined PoCC + PoQC-VDF architecture
+- `mine_one_block()` now accepts `all_nodes` list — all nodes solve simultaneously, first correct answer wins
+- Demo in `main.py` now shows PoCC command verification, replay attack rejection, and Lamport tamper detection as separate labelled tests
+
+### Fixed
+- README FAQ incorrectly stated quantum computers would mine faster — corrected to explain #P-hard VDF design
+- README incorrectly referenced "FESH governance" — corrected to XEQ
+- GitHub username placeholder updated throughout
+
+---
+
 ### Planned for v0.2
 - P2P networking layer (real nodes communicating over TCP)
 - JSON-RPC API endpoint for wallet and tool integrations

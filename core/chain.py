@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from collections import defaultdict
 from .crypto import sha3, sha3_hex, XequesWallet
+from .pocc   import PoCCRegistry, PoCCVerifier, Command
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -161,6 +162,7 @@ class Ledger:
         self.tx_rates   : Dict[str, int]   = defaultdict(int)
         self._total_amount = 0.0
         self._total_txs    = 0
+        self.pocc        = PoCCRegistry()   # PoCC command chain state
 
     @property
     def avg_amount(self) -> float:
