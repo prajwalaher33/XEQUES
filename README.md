@@ -11,7 +11,7 @@
 
 ### The blockchain that thinks. Built for a world where quantum computers exist.
 
-[**Quickstart**](#quickstart) · [**How it works**](#how-it-works) · [**Discord**](#community) · [**Contributing**](#want-to-help)
+[**Quickstart**](#quickstart) · [**How it works**](#how-it-works) · [**Contributing**](#want-to-help)
 
 [![MIT License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.10+-blue)](https://python.org)
@@ -272,7 +272,6 @@ If quantum cryptography, neuromorphic computing, or consensus design interests y
 
 ## Community
 
-- **Discord** — [discord.gg/xeques](#) — come talk, ask questions, find collaborators
 - **GitHub Issues** — bugs, feature requests, and proposals
 - **GitHub Discussions** — ideas, RFCs, and longer conversations
 
